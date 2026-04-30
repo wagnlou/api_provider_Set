@@ -292,6 +292,16 @@ cmd_edit() {
     ${EDITOR:-vi} "$PROFILES_FILE"
 }
 
+cmd_ui() {
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [ ! -f "$script_dir/cc-api-ui" ]; then
+        echo "Error: cc-api-ui not found in $script_dir" >&2
+        return 1
+    fi
+    python3 "$script_dir/cc-api-ui" "$@"
+}
+
 cmd_help() {
     cat <<'EOF'
 cc-api — Claude Code API Provider Switcher
@@ -307,6 +317,7 @@ Commands:
   add <name>            Add a new profile (interactive)
   remove <name>         Remove a profile
   edit <name>           Edit profiles file (in $EDITOR)
+  ui [--port PORT]      Launch Web UI in browser (requires: pip install flask)
   help                  Show this help
 
 Profiles file: ~/.claude/api_profiles.ini
@@ -325,5 +336,6 @@ case "${1:-help}" in
     model)          shift; cmd_model "$*" ;;
     tier)           shift; cmd_tier "$1" ;;
     edit)           shift; cmd_edit "$1" ;;
+    ui)             shift; cmd_ui "$@" ;;
     help|--help|-h|*) cmd_help ;;
 esac
