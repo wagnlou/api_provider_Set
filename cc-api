@@ -1,0 +1,329 @@
+#!/bin/bash
+
+# cc-api - Claude Code API Provider Switcher
+# Manage multiple API provider configurations for Claude Code
+
+PROFILES_FILE="${CC_API_PROFILES:-$HOME/.claude/api_profiles.ini}"
+SETTINGS_FILE="${CC_API_SETTINGS:-$HOME/.claude/settings.json}"
+
+# ── Helpers ──────────────────────────────────────────────
+
+_get_field() {
+    local profile="$1" field="$2"
+    awk -v section="[$profile]" -v key="$field" '
+        $0 == section { found=1; next }
+        /^\[.*\]/ && found { exit }
+        found && $1 == key { sub(/^[^=]*=[[:space:]]*/, ""); print; exit }
+    ' "$PROFILES_FILE"
+}
+
+_list_names() {
+    awk -F'[][]' '/^\[.*\]/{print $2}' "$PROFILES_FILE" 2>/dev/null
+}
+
+_profile_exists() {
+    grep -q "^\[$1\]" "$PROFILES_FILE" 2>/dev/null
+}
+
+_update_settings() {
+    local key="$1" url="$2" model="$3" tier="$4" default_haiku="$5" default_sonnet="$6" default_opus="$7"
+    python3 -c "
+import json, sys
+cfg = {}
+try:
+    with open('$SETTINGS_FILE') as f:
+        cfg = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    pass
+cfg.setdefault('env', {})
+cfg['env']['ANTHROPIC_AUTH_TOKEN'] = '$key'
+cfg['env']['ANTHROPIC_BASE_URL'] = '$url'
+
+for var in ('ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+            'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL'):
+    cfg['env'].pop(var, None)
+
+if '$model':   cfg['env']['ANTHROPIC_MODEL'] = '$model'
+if '$default_haiku': cfg['env']['ANTHROPIC_DEFAULT_HAIKU_MODEL'] = '$default_haiku'
+if '$default_sonnet': cfg['env']['ANTHROPIC_DEFAULT_SONNET_MODEL'] = '$default_sonnet'
+if '$default_opus': cfg['env']['ANTHROPIC_DEFAULT_OPUS_MODEL'] = '$default_opus'
+
+if '$tier':
+    cfg['model'] = '$tier'
+else:
+    cfg.pop('model', None)
+
+with open('$SETTINGS_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+    f.write('\n')
+" 2>/dev/null || {
+    echo "Error: Failed to update settings.json" >&2
+    return 1
+}
+}
+
+_get_current_key() {
+    grep -o '"ANTHROPIC_AUTH_TOKEN"[[:space:]]*:[[:space:]]*"[^"]*"' "$SETTINGS_FILE" 2>/dev/null | sed 's/.*"\(.*\)"/\1/'
+}
+
+# ── Commands ─────────────────────────────────────────────
+
+cmd_list() {
+    if [ ! -f "$PROFILES_FILE" ]; then
+        echo "No profiles found. Use 'cc-api add <name>' to create one."
+        return
+    fi
+    local current_key
+    current_key=$(_get_current_key)
+    local found=false
+    echo "Available profiles:"
+    while IFS= read -r name; do
+        [ -z "$name" ] && continue
+        local ak url model tier dh ds dop
+        ak=$(_get_field "$name" "api_key")
+        url=$(_get_field "$name" "base_url")
+        model=$(_get_field "$name" "model")
+        tier=$(_get_field "$name" "tier")
+        dh=$(_get_field "$name" "default_haiku")
+        ds=$(_get_field "$name" "default_sonnet")
+        dop=$(_get_field "$name" "default_opus")
+        if [ "$ak" = "$current_key" ]; then
+            echo "  * $name"
+        else
+            echo "    $name"
+        fi
+        echo "      URL:   $url"
+        echo "      Model: ${model:-<default>}"
+        [ -n "$tier" ] && echo "      Tier:  $tier"
+        [ -n "$dh" ] || [ -n "$ds" ] || [ -n "$dop" ] && echo "      Tier models: haiku=${dh:--} sonnet=${ds:--} opus=${dop:--}"
+        found=true
+    done < <(_list_names)
+    $found || echo "  (none)"
+}
+
+cmd_show() {
+    if [ ! -f "$SETTINGS_FILE" ]; then
+        echo "settings.json not found"
+        return 1
+    fi
+    python3 -c "
+import json, sys
+try:
+    with open('$SETTINGS_FILE') as f:
+        cfg = json.load(f)
+except:
+    print('Error: Failed to read settings.json')
+    sys.exit(1)
+env = cfg.get('env', {})
+print('Current configuration:')
+print('  API Key:            ' + env.get('ANTHROPIC_AUTH_TOKEN', '(not set)'))
+print('  Base URL:           ' + env.get('ANTHROPIC_BASE_URL', '(not set)'))
+print('  Model:              ' + env.get('ANTHROPIC_MODEL', '(not set)'))
+print('  Tier (opus/sonnet/haiku): ' + cfg.get('model', '(not set)'))
+print('  Default tier models:')
+print('    Haiku:            ' + env.get('ANTHROPIC_DEFAULT_HAIKU_MODEL', '(not set)'))
+print('    Sonnet:           ' + env.get('ANTHROPIC_DEFAULT_SONNET_MODEL', '(not set)'))
+print('    Opus:             ' + env.get('ANTHROPIC_DEFAULT_OPUS_MODEL', '(not set)'))
+"
+}
+
+cmd_switch() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        echo "Usage: cc-api switch <name>" >&2
+        return 1
+    fi
+    if ! _profile_exists "$name"; then
+        echo "Error: Profile '$name' not found" >&2
+        return 1
+    fi
+    local key url model tier dh ds dop
+    key=$(_get_field "$name" "api_key")
+    url=$(_get_field "$name" "base_url")
+    model=$(_get_field "$name" "model")
+    tier=$(_get_field "$name" "tier")
+    dh=$(_get_field "$name" "default_haiku")
+    ds=$(_get_field "$name" "default_sonnet")
+    dop=$(_get_field "$name" "default_opus")
+    if [ -z "$key" ] || [ -z "$url" ]; then
+        echo "Error: Profile '$name' is incomplete (missing api_key or base_url)" >&2
+        return 1
+    fi
+    if ! _update_settings "$key" "$url" "$model" "$tier" "$dh" "$ds" "$dop"; then
+        return 1
+    fi
+    echo "Switched to profile '$name'"
+    echo "  Base URL: $url"
+    [ -n "$model" ] && echo "  Model:    $model"
+    [ -n "$tier" ] && echo "  Tier:     $tier"
+}
+
+cmd_add() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        echo "Usage: cc-api add <name>" >&2
+        return 1
+    fi
+    if _profile_exists "$name"; then
+        echo "Error: Profile '$name' already exists" >&2
+        return 1
+    fi
+    echo "Adding profile '$name'"
+    read -r -p "  API Key: " api_key
+    read -r -p "  Base URL: " base_url
+    read -r -p "  Model (optional): " model
+    read -r -p "  Tier (opus/sonnet/haiku, optional): " tier
+    read -r -p "  Default haiku model (optional): " default_haiku
+    read -r -p "  Default sonnet model (optional): " default_sonnet
+    read -r -p "  Default opus model (optional): " default_opus
+    if [ -z "$api_key" ] || [ -z "$base_url" ]; then
+        echo "Error: api_key and base_url are required" >&2
+        return 1
+    fi
+    mkdir -p "$(dirname "$PROFILES_FILE")"
+    {
+        echo ""
+        echo "[$name]"
+        echo "api_key = $api_key"
+        echo "base_url = $base_url"
+        [ -n "$model" ] && echo "model = $model"
+        [ -n "$tier" ] && echo "tier = $tier"
+        [ -n "$default_haiku" ] && echo "default_haiku = $default_haiku"
+        [ -n "$default_sonnet" ] && echo "default_sonnet = $default_sonnet"
+        [ -n "$default_opus" ] && echo "default_opus = $default_opus"
+    } >> "$PROFILES_FILE"
+    echo "Profile '$name' added."
+}
+
+cmd_remove() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        echo "Usage: cc-api remove <name>" >&2
+        return 1
+    fi
+    if ! _profile_exists "$name"; then
+        echo "Error: Profile '$name' not found" >&2
+        return 1
+    fi
+    read -r -p "Remove profile '$name'? [y/N] " confirm
+    case "$confirm" in
+        [yY]|[yY][eE][sS]) ;;
+        *) echo "Cancelled."; return ;;
+    esac
+    awk -v section="[$name]" '
+        $0 == section { skip = 1; next }
+        /^\[.*\]/ && skip { skip = 0 }
+        !skip { print }
+    ' "$PROFILES_FILE" > "${PROFILES_FILE}.tmp" && mv "${PROFILES_FILE}.tmp" "$PROFILES_FILE"
+    echo "Profile '$name' removed."
+}
+
+cmd_model() {
+    local model="$1"
+    if [ -z "$model" ]; then
+        echo "Usage: cc-api model <model-name>" >&2
+        echo "       cc-api model --clear    (remove model setting)" >&2
+        echo "Examples:" >&2
+        echo "  cc-api model claude-sonnet-4-6" >&2
+        echo "  cc-api model claude-opus-4-7" >&2
+        return 1
+    fi
+    if [ "$model" = "--clear" ]; then
+        python3 -c "
+import json
+with open('$SETTINGS_FILE') as f:
+    cfg = json.load(f)
+cfg.setdefault('env', {}).pop('ANTHROPIC_MODEL', None)
+with open('$SETTINGS_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+    f.write('\n')
+" 2>/dev/null || { echo "Error" >&2; return 1; }
+        echo "Model cleared (using provider default)."
+        return
+    fi
+    python3 -c "
+import json
+with open('$SETTINGS_FILE') as f:
+    cfg = json.load(f)
+cfg.setdefault('env', {})
+cfg['env']['ANTHROPIC_MODEL'] = '$model'
+with open('$SETTINGS_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+    f.write('\n')
+" 2>/dev/null || {
+    echo "Error: Failed to update settings.json" >&2
+    return 1
+}
+    echo "Model set to: $model"
+}
+
+cmd_tier() {
+    local tier="$1"
+    if [ -z "$tier" ]; then
+        echo "Usage: cc-api tier <opus|sonnet|haiku>" >&2
+        return 1
+    fi
+    case "$tier" in
+        opus|sonnet|haiku) ;;
+        *) echo "Error: tier must be one of: opus, sonnet, haiku" >&2; return 1 ;;
+    esac
+    python3 -c "
+import json
+with open('$SETTINGS_FILE') as f:
+    cfg = json.load(f)
+cfg['model'] = '$tier'
+with open('$SETTINGS_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2)
+    f.write('\n')
+" 2>/dev/null || { echo "Error" >&2; return 1; }
+    echo "Tier set to: $tier"
+}
+
+cmd_edit() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        echo "Usage: cc-api edit <name>" >&2
+        return 1
+    fi
+    if ! _profile_exists "$name"; then
+        echo "Error: Profile '$name' not found" >&2
+        return 1
+    fi
+    ${EDITOR:-vi} "$PROFILES_FILE"
+}
+
+cmd_help() {
+    cat <<'EOF'
+cc-api — Claude Code API Provider Switcher
+
+Usage: cc-api <command> [args]
+
+Commands:
+  list                  List all profiles with details
+  show                  Show current configuration
+  switch <name>         Switch to a profile (key + url + model + tier)
+  model <name>          Quick-switch model only (ANTHROPIC_MODEL)
+  tier <opus|sonnet|haiku>  Quick-switch Claude Code tier
+  add <name>            Add a new profile (interactive)
+  remove <name>         Remove a profile
+  edit <name>           Edit profiles file (in $EDITOR)
+  help                  Show this help
+
+Profiles file: ~/.claude/api_profiles.ini
+Settings file: ~/.claude/settings.json
+EOF
+}
+
+# ── Main Dispatch ────────────────────────────────────────
+
+case "${1:-help}" in
+    list|ls)        cmd_list ;;
+    show|current)   cmd_show ;;
+    switch|use)     shift; cmd_switch "$1" ;;
+    add|create)     shift; cmd_add "$1" ;;
+    remove|rm)      shift; cmd_remove "$1" ;;
+    model)          shift; cmd_model "$*" ;;
+    tier)           shift; cmd_tier "$1" ;;
+    edit)           shift; cmd_edit "$1" ;;
+    help|--help|-h|*) cmd_help ;;
+esac
